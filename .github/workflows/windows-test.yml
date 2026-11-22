@@ -59,11 +59,21 @@ jobs:
           $prozesse = @(Get-Process "7 Zutaten Hub" -ErrorAction SilentlyContinue)
           $fenster = ($prozesse | Where-Object { $_.MainWindowTitle } | Select-Object -First 1).MainWindowTitle
           $seiten = try { Invoke-RestMethod "http://127.0.0.1:9333/json/list" } catch { @() }
+          # Passt das Fenster auf die Arbeitsfläche (Bildschirm ohne Taskleiste)?
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public struct R{public int L,T,Ri,B;}public static class W{[DllImport("user32.dll")]public static extern bool GetWindowRect(IntPtr h,out R r);}'
+          $h = ($prozesse | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1).MainWindowHandle
+          $r = New-Object R; [void][W]::GetWindowRect($h, [ref]$r)
+          $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+          $passt = ($r.L -ge $wa.Left - 8) -and ($r.T -ge $wa.Top - 8) -and ($r.Ri -le $wa.Right + 8) -and ($r.B -le $wa.Bottom + 8)
           $ergebnis = [ordered]@{
             prozesse = $prozesse.Count
             fenstertitel = $fenster
             seiten = @($seiten | ForEach-Object { "$($_.type): $($_.title) – $($_.url)" })
             hub_geladen = [bool]$seite
+            fenster = "$($r.L),$($r.T) bis $($r.Ri),$($r.B)"
+            arbeitsflaeche = "$($wa.Left),$($wa.Top) bis $($wa.Right),$($wa.Bottom)"
+            fenster_passt = $passt
           }
           $ergebnis | ConvertTo-Json | Tee-Object "$env:RUNNER_TEMP\ergebnis\ergebnis.json"
           # Bildschirmfoto
@@ -76,6 +86,7 @@ jobs:
           if (Test-Path $log) { Copy-Item $log "$env:RUNNER_TEMP\ergebnis\fehler.log"; "fehler.log vorhanden:"; Get-Content $log -Tail 30 }
           if ($prozesse.Count -eq 0) { throw "App läuft nicht (abgestürzt?)" }
           if (-not $seite) { throw "Hub-Seite wurde im App-Fenster nicht geladen" }
+          if (-not $passt) { throw "Fenster ragt über die Arbeitsfläche hinaus" }
           "OK: App läuft, Hub geladen ($($seite.url))"
 
       - name: Ergebnis hochladen
