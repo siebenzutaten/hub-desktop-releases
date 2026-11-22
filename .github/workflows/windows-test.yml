@@ -1,0 +1,86 @@
+# Windows-Rauchtest der Desktop-App: Installer vom neuesten Release laden, still installieren,
+# starten und prüfen, dass der Hub (Login-Seite) im App-Fenster lädt. Ergebnis + Bildschirmfoto
+# als Artefakt. Läuft bei jedem neuen Release und von Hand (Actions → Windows-Test → Run).
+name: Windows-Test
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release-Tag (leer = neuestes)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Installer laden
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          $args = @("release","download","--repo","${{ github.repository }}","--pattern","7-Zutaten-Hub-windows-setup.exe","--dir","$env:RUNNER_TEMP")
+          if ($env:TAG) { $args = @("release","download",$env:TAG) + $args[2..($args.Length-1)] }
+          gh @args
+          Get-Item "$env:RUNNER_TEMP\7-Zutaten-Hub-windows-setup.exe" | Format-List Name,Length
+
+      - name: Still installieren
+        shell: pwsh
+        run: |
+          $p = Start-Process "$env:RUNNER_TEMP\7-Zutaten-Hub-windows-setup.exe" -ArgumentList "/S" -PassThru -Wait
+          "Installer-Rückgabe: $($p.ExitCode)"
+          Start-Sleep 5
+          $exe = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Recurse -Filter "7 Zutaten Hub.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw "App nach der Installation nicht gefunden" }
+          "APP=$($exe.FullName)" | Out-File -Append $env:GITHUB_ENV
+          "Installiert: $($exe.FullName)"
+          "Startmenü-Verknüpfung: " + (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\7 Zutaten Hub.lnk")
+          # Ein-Klick-Installer startet die App evtl. direkt – für einen sauberen Start beenden.
+          Get-Process "7 Zutaten Hub" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep 2
+
+      - name: App starten und Hub-Seite prüfen
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\ergebnis" | Out-Null
+          Start-Process $env:APP -ArgumentList "--remote-debugging-port=9333"
+          $seite = $null
+          for ($i = 0; $i -lt 45 -and -not $seite; $i++) {
+            Start-Sleep 2
+            try { $seite = (Invoke-RestMethod "http://127.0.0.1:9333/json/list") | Where-Object { $_.type -eq "page" -and $_.url -like "https://hub.7-zutaten.com*" } | Select-Object -First 1 } catch {}
+          }
+          Start-Sleep 8
+          $prozesse = @(Get-Process "7 Zutaten Hub" -ErrorAction SilentlyContinue)
+          $fenster = ($prozesse | Where-Object { $_.MainWindowTitle } | Select-Object -First 1).MainWindowTitle
+          $seiten = try { Invoke-RestMethod "http://127.0.0.1:9333/json/list" } catch { @() }
+          $ergebnis = [ordered]@{
+            prozesse = $prozesse.Count
+            fenstertitel = $fenster
+            seiten = @($seiten | ForEach-Object { "$($_.type): $($_.title) – $($_.url)" })
+            hub_geladen = [bool]$seite
+          }
+          $ergebnis | ConvertTo-Json | Tee-Object "$env:RUNNER_TEMP\ergebnis\ergebnis.json"
+          # Bildschirmfoto
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("$env:RUNNER_TEMP\ergebnis\bildschirm.png")
+          $log = Join-Path $env:APPDATA "7 Zutaten Hub\fehler.log"
+          if (Test-Path $log) { Copy-Item $log "$env:RUNNER_TEMP\ergebnis\fehler.log"; "fehler.log vorhanden:"; Get-Content $log -Tail 30 }
+          if ($prozesse.Count -eq 0) { throw "App läuft nicht (abgestürzt?)" }
+          if (-not $seite) { throw "Hub-Seite wurde im App-Fenster nicht geladen" }
+          "OK: App läuft, Hub geladen ($($seite.url))"
+
+      - name: Ergebnis hochladen
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-ergebnis
+          path: ${{ runner.temp }}/ergebnis
